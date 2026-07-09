@@ -3,7 +3,6 @@ using Oceananigans.ImmersedBoundaries: GridFittedBottom
 using Oceananigans.Grids: xnodes, ynodes, znodes
 using Oceananigans.Units
 using Oceananigans.Architectures: architecture
-using Oceananigans.Models.NonhydrostaticModels: ConjugateGradientPoissonSolver
 using Oceananigans.Operators
 using Oceananigans.Utils: launch!
 using KernelAbstractions: @kernel, @index
@@ -65,7 +64,7 @@ const z₀ = -H
 const z₁ = 0.0
 
 const S_shelf = 35.0
-const S_river = 0.0
+const S_river = 30.0
 
 const river_width = 500.0
 const river_centers = (2.5e3, 12.5e3) # 10 km center-to-center spacing
@@ -79,7 +78,7 @@ const νh = 0.05
 const κh = 0.05
 const Cd = 2e-3
 
-filename = string("two_river_channels_land_channels_Nx_", Nx, "_Ny_", Ny, "_Nz_", Nz, "_Q_", Int(river_discharge), "m3s_1hour")
+filename = string("two_river_channels_hydrostatic_land_channels_Nx_", Nx, "_Ny_", Ny, "_Nz_", Nz, "_Q_", Int(river_discharge), "m3s_Sriver_", Int(S_river), "_1hour")
 FILE_DIR = joinpath("Data", filename)
 mkpath(FILE_DIR)
 
@@ -123,11 +122,11 @@ grid = RectilinearGrid(arch, Float64,
 
 grid = ImmersedBoundaryGrid(grid, GridFittedBottom(bathymetry))
 
-v_north_bc = NormalFlowBoundaryCondition(river_v_velocity;
+v_north_bc = NormalFlowBoundaryCondition(-river_velocity;
                                          scheme = PerturbationAdvection(target_transport = total_river_transport))
-v_south_bc = NormalFlowBoundaryCondition(south_outflow;
+v_south_bc = NormalFlowBoundaryCondition(south_outflow_velocity;
                                          scheme = PerturbationAdvection())
-S_north_bc = ValueBoundaryCondition(river_salinity)
+S_north_bc = ValueBoundaryCondition(S_river)
 
 quadratic_drag = BulkDrag(coefficient = Cd)
 
@@ -142,14 +141,15 @@ S_bcs = FieldBoundaryConditions(north = S_north_bc)
 boundary_conditions = (u = u_bcs, v = v_bcs, w = w_bcs, S = S_bcs)
 
 closure = ScalarDiffusivity(ν = νh, κ = κh)
-pressure_solver = ConjugateGradientPoissonSolver(grid)
+free_surface = SplitExplicitFreeSurface(grid; cfl = 0.7)
 
-model = NonhydrostaticModel(grid;
-                            pressure_solver,
-                            advection = WENO(order = 5),
-                            tracers = (:S,),
-                            closure,
-                            boundary_conditions)
+model = HydrostaticFreeSurfaceModel(grid;
+                                   free_surface,
+                                   momentum_advection = VectorInvariant(),
+                                   tracer_advection = WENO(order = 5),
+                                   tracers = (:S,),
+                                   closure,
+                                   boundary_conditions)
 
 set!(model, S = initial_salinity)
 
@@ -231,37 +231,19 @@ simulation.callbacks[:wizard] = Callback(time_wizard, IterationInterval(1))
 u, v, w = model.velocities
 S = model.tracers.S
 
-d = CenterField(grid)
-
-@kernel function _divergence!(target_field, u, v, w, grid)
-    i, j, k = @index(Global, NTuple)
-    @inbounds target_field[i, j, k] = divᶜᶜᶜ(i, j, k, grid, u, v, w)
-end
-
-function compute_flow_divergence!(target_field, model)
-    grid = model.grid
-    u, v, w = model.velocities
-    arch = architecture(grid)
-    launch!(arch, grid, :xyz, _divergence!, target_field, u, v, w, grid)
-    return nothing
-end
-
 wall_clock = Ref(time_ns())
 
 function progress(sim)
     elapsed = 1e-9 * (time_ns() - wall_clock[])
-    compute_flow_divergence!(d, sim.model)
-
     msg = @sprintf("i: %d, t: %s, wall t: %s, Δt: %s",
                    iteration(sim), prettytime(sim), prettytime(elapsed), prettytime(sim.Δt))
 
-    msg *= @sprintf(", max |u|: %6.3e, max |v|: %6.3e, max |w|: %6.3e, min S: %6.3f, max S: %6.3f, max div: %6.3e",
-                    maximum(abs, sim.model.velocities.u),
-                    maximum(abs, sim.model.velocities.v),
-                    maximum(abs, sim.model.velocities.w),
-                    minimum(sim.model.tracers.S),
-                    maximum(sim.model.tracers.S),
-                    maximum(abs, d))
+    stats = string(", max |u|: ", maximum(abs, sim.model.velocities.u),
+                   ", max |v|: ", maximum(abs, sim.model.velocities.v),
+                   ", min S: ", minimum(sim.model.tracers.S),
+                   ", max S: ", maximum(sim.model.tracers.S))
+
+    msg = string(msg, stats)
 
     wall_clock[] = time_ns()
     @info msg
