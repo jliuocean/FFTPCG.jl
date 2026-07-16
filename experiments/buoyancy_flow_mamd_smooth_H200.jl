@@ -96,7 +96,7 @@ const κ₄h = 1e5
 const ν₄z = 1e-3
 const κ₄z = 1e-3
 
-filename = string("MAMD_WB400_Santee10_Nx_", Nx, "_Ny_", Ny, "_Nz_", Nz, "_spacing_", Int(inlet_center_spacing), "m_smooth_buoyancy")
+filename = string("/mnt/workdir/jliu1/Oceananigans/plumes/MAMD_WB400_Santee10_Nx_", Nx, "_Ny_", Ny, "_Nz_", Nz, "_spacing_", Int(inlet_center_spacing), "m_smooth_buoyancy")
 FILE_DIR = joinpath("Data", filename)
 mkpath(FILE_DIR)
 
