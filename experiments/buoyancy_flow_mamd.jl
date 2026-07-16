@@ -26,7 +26,7 @@ function parse_commandline()
         "--stop-time"
             help = "Simulation stop time in seconds"
             arg_type = Float64
-            default = 21600minutes
+            default = 86400.0
     end
 
     return parse_args(s)
@@ -42,13 +42,13 @@ arch = ARCH == "GPU" ? GPU() : CPU()
 ##### Domain and buoyant inflow parameters
 #####
 
-const Lx = 40e3
-const Ly = 20e3
+const Lx = 25e3
+const Ly = 15e3
 const Lz = 20.0
 
-const Δx = 100.0
-const Δy = 100.0
-const Nz = 20
+const Δx = 20.0
+const Δy = 20.0
+const Nz = 200
 const Δz = Lz / Nz
 
 const Nx = Int(Lx / Δx)
@@ -67,10 +67,10 @@ const inlet_center_spacing = 10e3
 const inlet_centers = (-inlet_center_spacing / 2, inlet_center_spacing / 2)
 const embayment_depth = 5.0
 const inlet_depth = embayment_depth
-const santee_inlet_speed = 0.002
-const winyah_inlet_speed = 0.14
+const santee_inlet_speed = 0.02
+const winyah_inlet_speed = 0.06
 const santee_N² = 1e-2
-const winyah_N² = 5e-3
+const winyah_N² = 2e-2
 const shelf_N² = 1e-5
 const N² = shelf_N²
 const plume_surface_buoyancy = max(santee_N², winyah_N²) * inlet_depth
@@ -221,16 +221,13 @@ c_winyah_bcs = FieldBoundaryConditions(north = c_winyah_north_bc)
 
 boundary_conditions = (u = u_bcs, v = v_bcs, w = w_bcs, b = b_bcs,
                        c_santee = c_santee_bcs, c_winyah = c_winyah_bcs)
-
  function sponge_mask(x, y)
     west = smoothstep((x₀ + sponge_width - x) / sponge_width)
     east = smoothstep((x - (x₁ - sponge_width)) / sponge_width)
     south = smoothstep((y₀ + sponge_width - y) / sponge_width)
     return max(west, east, south)
 end
-
  sponge_relaxation(x, y, field, target) = -sponge_rate * sponge_mask(x, y) * (field - target)
-
  u_sponge(x, y, z, t, u) = sponge_relaxation(x, y, u, 0.0)
  v_sponge(x, y, z, t, v) = sponge_relaxation(x, y, v, 0.0)
  b_sponge(x, y, z, t, b) = sponge_relaxation(x, y, b, ambient_buoyancy(z))
@@ -420,7 +417,7 @@ stop_time = args["stop-time"]
 Δt = 1
 
 simulation = Simulation(model; Δt, stop_time)
-time_wizard = TimeStepWizard(cfl = 0.3, max_change = 1.05, max_Δt = 20.0)
+time_wizard = TimeStepWizard(cfl = 0.3, max_change = 1.05, max_Δt = 5.0)
 simulation.callbacks[:wizard] = Callback(time_wizard, IterationInterval(1))
 
 u, v, w = model.velocities
@@ -477,7 +474,7 @@ end
 
 simulation.callbacks[:progress] = Callback(progress, IterationInterval(5))
 
-simulation.output_writers[:jld2] = JLD2Writer(model, (; u, v, w, b, c_santee, c_winyah);
+simulation.output_writers[:jld2] = JLD2Writer(model, (; b, c_santee, c_winyah);
                                               filename = joinpath(FILE_DIR, "instantaneous_fields.jld2"),
                                               schedule = TimeInterval(1hour),
                                               with_halos = true,
@@ -558,7 +555,7 @@ function save_surface_buoyancy_animation()
     Colorbar(fig[:, 3], hm_xy; label = "Buoyancy")
 
     time_label = lift(n) do nn
-        string("t = ", round(times[nn] / 60; digits = 1), " min")
+        string("t = ", round(times[nn] / 3600; digits = 1), " hour")
     end
     Label(fig[0, :], time_label, fontsize = 22)
 
@@ -662,7 +659,7 @@ function save_surface_tracer_animation()
     Colorbar(fig[:, 4], hm_winyah; label = "Winyah tracer")
 
     time_label = lift(n) do nn
-        string("t = ", round(times[nn] / 60; digits = 1), " min")
+        string("t = ", round(times[nn] / 3600; digits = 1), " hour")
     end
     Label(fig[0, :], time_label, fontsize = 22)
 
@@ -757,7 +754,7 @@ function save_3d_tracer_animation()
     Colorbar(fig[1, 2], santee_plume; label = "Santee tracer")
     Colorbar(fig[1, 3], winyah_plume; label = "Winyah tracer")
 
-    time_label = Observable(string("t = ", round(times[1] / 60; digits = 1), " min"))
+    time_label = Observable(string("t = ", round(times[1] / 3600; digits = 1), " hour"))
     Label(fig[0, :], time_label, fontsize = 22)
 
     xlims!(ax, extrema(xC)...)
@@ -775,7 +772,7 @@ function save_3d_tracer_animation()
         ys_w[] = new_ys_w
         zs_w[] = new_zs_w
         cs_w[] = new_cs_w
-        time_label[] = string("t = ", round(times[nn] / 60; digits = 1), " min")
+        time_label[] = string("t = ", round(times[nn] / 3600; digits = 1), " hour")
     end
 
     return nothing
@@ -875,7 +872,7 @@ function save_3d_tracer_contour_animation()
     Colorbar(fig[1, 2], santee_face; label = "Santee tracer")
     Colorbar(fig[1, 3], winyah_face; label = "Winyah tracer")
 
-    time_label = Observable(string("t = ", round(times[1] / 60; digits = 1), " min"))
+    time_label = Observable(string("t = ", round(times[1] / 3600; digits = 1), " hour"))
     Label(fig[0, :], time_label, fontsize = 22)
 
     xlims!(ax, extrema(xC)...)
@@ -889,7 +886,7 @@ function save_3d_tracer_contour_animation()
         c_winyah_mouth[] = Array(interior(c_winyah_data[nn], :, j_mouth, :))
         c_santee_mid[] = Array(interior(c_santee_data[nn], :, j_y0, :))
         c_winyah_mid[] = Array(interior(c_winyah_data[nn], :, j_y0, :))
-        time_label[] = string("t = ", round(times[nn] / 60; digits = 1), " min")
+        time_label[] = string("t = ", round(times[nn] / 3600; digits = 1), " hour")
     end
 
     return nothing
