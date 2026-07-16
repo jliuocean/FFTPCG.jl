@@ -26,7 +26,7 @@ function parse_commandline()
         "--stop-time"
             help = "Simulation stop time in seconds"
             arg_type = Float64
-            default = 21600minutes
+            default = 2880minutes
     end
 
     return parse_args(s)
@@ -42,13 +42,13 @@ arch = ARCH == "GPU" ? GPU() : CPU()
 ##### Domain and buoyant inflow parameters
 #####
 
-const Lx = 40e3
-const Ly = 20e3
+const Lx = 15e3
+const Ly = 25e3
 const Lz = 20.0
 
-const Δx = 100.0
-const Δy = 100.0
-const Nz = 20
+const Δx = 25.0
+const Δy = 25.0
+const Nz = 40
 const Δz = Lz / Nz
 
 const Nx = Int(Lx / Δx)
@@ -221,16 +221,13 @@ c_winyah_bcs = FieldBoundaryConditions(north = c_winyah_north_bc)
 
 boundary_conditions = (u = u_bcs, v = v_bcs, w = w_bcs, b = b_bcs,
                        c_santee = c_santee_bcs, c_winyah = c_winyah_bcs)
-
  function sponge_mask(x, y)
     west = smoothstep((x₀ + sponge_width - x) / sponge_width)
     east = smoothstep((x - (x₁ - sponge_width)) / sponge_width)
     south = smoothstep((y₀ + sponge_width - y) / sponge_width)
     return max(west, east, south)
 end
-
  sponge_relaxation(x, y, field, target) = -sponge_rate * sponge_mask(x, y) * (field - target)
-
  u_sponge(x, y, z, t, u) = sponge_relaxation(x, y, u, 0.0)
  v_sponge(x, y, z, t, v) = sponge_relaxation(x, y, v, 0.0)
  b_sponge(x, y, z, t, b) = sponge_relaxation(x, y, b, ambient_buoyancy(z))
@@ -479,7 +476,7 @@ end
 
 simulation.callbacks[:progress] = Callback(progress, IterationInterval(5))
 
-simulation.output_writers[:jld2] = JLD2Writer(model, (; u, v, w, b, c_santee, c_winyah);
+simulation.output_writers[:jld2] = JLD2Writer(model, (; b, c_santee, c_winyah);
                                               filename = joinpath(FILE_DIR, "instantaneous_fields.jld2"),
                                               schedule = TimeInterval(1hour),
                                               with_halos = true,
