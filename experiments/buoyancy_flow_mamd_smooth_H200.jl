@@ -23,20 +23,70 @@ function parse_commandline()
         "--setup-only"
             help = "Build the model and save initial condition plots without running the simulation"
             action = :store_true
+        "--plot-only"
+            help = "Skip the simulation and regenerate animations from an existing instantaneous_fields.jld2"
+            action = :store_true
+        "--contours-only"
+            help = "With --plot-only, regenerate only tracers_3d_contours.mp4"
+            action = :store_true
+        "--buoyancy-3d-only"
+            help = "With --plot-only, regenerate only buoyancy_3d.mp4"
+            action = :store_true
         "--stop-time"
             help = "Simulation stop time in seconds"
             arg_type = Float64
             default = 86400.0
+        "--pickup"
+            help = "Checkpoint restart mode: false, true/latest/recent/highest, iteration number, or checkpoint filepath"
+            arg_type = String
+            default = "false"
+        "--checkpoint-interval"
+            help = "Checkpoint interval in seconds"
+            arg_type = Float64
+            default = 3600.0
+        "--u10"
+            help = "10 m wind velocity in the x direction (m/s); positive is upwelling-favorable"
+            arg_type = Float64
+            default = 5.0
+        "--v10"
+            help = "10 m wind velocity in the y direction (m/s)"
+            arg_type = Float64
+            default = 0.0
+        "--wind-ramp-time"
+            help = "Wind ramp-up time in seconds"
+            arg_type = Float64
+            default = 21600.0
     end
 
     return parse_args(s)
 end
 
+function parse_pickup_argument(pickup)
+    pickup = strip(pickup)
+    pickup_lower = lowercase(pickup)
+
+    pickup_lower in ("false", "none", "no", "0") && return false
+    pickup_lower in ("true", "latest") && return :latest
+    pickup_lower in ("recent", "recent_time_stamp") && return :recent_time_stamp
+    pickup_lower in ("highest", "highest_iteration") && return :highest_iteration
+
+    iteration = tryparse(Int, pickup)
+    isnothing(iteration) || return iteration
+
+    return pickup
+end
+
 args = parse_commandline()
+args["setup-only"] && args["plot-only"] && error("--setup-only and --plot-only cannot be used together")
+args["contours-only"] && !args["plot-only"] && error("--contours-only requires --plot-only")
+args["buoyancy-3d-only"] && !args["plot-only"] && error("--buoyancy-3d-only requires --plot-only")
+args["contours-only"] && args["buoyancy-3d-only"] && error("Choose only one plot-only target")
 const ARCH = uppercase(args["arch"])
 ARCH in ("GPU", "CPU") || error("Invalid --arch $(ARCH); must be GPU or CPU")
 
 arch = ARCH == "GPU" ? GPU() : CPU()
+
+const PICKUP = parse_pickup_argument(args["pickup"])
 
 #####
 ##### Domain and buoyant inflow parameters
@@ -69,19 +119,47 @@ const embayment_depth = 5.0
 const inlet_depth = embayment_depth
 const santee_inlet_speed = 0.02
 const winyah_inlet_speed = 0.06
-const santee_N² = 1e-2
-const winyah_N² = 2e-2
 const shelf_N² = 1e-5
 const N² = shelf_N²
-const winyah_surface_buoyancy = winyah_N² * inlet_depth
-const santee_surface_buoyancy = winyah_surface_buoyancy + 0.5 * santee_N² * inlet_depth
+const river_bottom_buoyancy = -shelf_N² * inlet_depth
+const santee_N² = 2e-2
+const winyah_N² = 1e-2
+const santee_surface_buoyancy = river_bottom_buoyancy + santee_N² * inlet_depth
+const winyah_surface_buoyancy = river_bottom_buoyancy + winyah_N² * inlet_depth
 const plume_surface_buoyancy = max(santee_surface_buoyancy, winyah_surface_buoyancy)
 const f₀ = 1e-4
 const Cd = 2e-3
+const ρ₀ = 1025.0
+const ρ_air = 1.225
+const Cᴰ_air = 1.3e-3
+const U₁₀ = args["u10"]
+const V₁₀ = args["v10"]
+const U₁₀_magnitude = hypot(U₁₀, V₁₀)
+const WIND_RAMP_TIME = args["wind-ramp-time"]
+# Physical atmospheric wind stress components (Pa).
+const τx_wind = ρ_air * Cᴰ_air * U₁₀_magnitude * U₁₀
+const τy_wind = ρ_air * Cᴰ_air * U₁₀_magnitude * V₁₀
+# Oceananigans top boundary conditions use outward-normal kinematic momentum
+# fluxes (m² s⁻²), hence the minus sign at the upper boundary.
+const Qx_wind = -τx_wind / ρ₀
+const Qy_wind = -τy_wind / ρ₀
+@info "Full-strength wind forcing" U₁₀ V₁₀ U₁₀_magnitude τx_wind τy_wind Qx_wind Qy_wind
 const embayment_length_y = 200.0
 const river_mouth_y = y₁ - embayment_length_y
+const river_shelf_transition_length = 1e3
+const channel_edge_transition_width = 200.0
 const slope_depth = 15.0
 const initial_buoyancy_noise = 1e-6
+
+# Both rivers match the shelf at the channel bottom. Lower buoyancy means
+# denser water; because the profiles share a bottom value and Winyah has the
+# smaller vertical gradient, Winyah is denser everywhere above the bottom.
+@assert isapprox(santee_surface_buoyancy - santee_N² * inlet_depth,
+                 river_bottom_buoyancy; atol = 10eps(Float64))
+@assert isapprox(winyah_surface_buoyancy - winyah_N² * inlet_depth,
+                 river_bottom_buoyancy; atol = 10eps(Float64))
+@assert winyah_surface_buoyancy < santee_surface_buoyancy
+@assert winyah_N² < santee_N²
 
 const inlet_transport = -inlet_width * inlet_depth * (santee_inlet_speed + winyah_inlet_speed)
 const shelf_open_boundary_length_y = river_mouth_y - y₀
@@ -96,8 +174,24 @@ const κ₄h = 1e5
 const ν₄z = 1e-3
 const κ₄z = 1e-3
 
-filename = string("/mnt/workdir/jliu1/Oceananigans/plumes/MAMD_WB400_Santee10_Nx_", Nx, "_Ny_", Ny, "_Nz_", Nz, "_spacing_", Int(inlet_center_spacing), "m_smooth_buoyancy")
-FILE_DIR = joinpath("Data", filename)
+function wind_speed_suffix(u₁₀, v₁₀)
+    u₁₀ == 0 && v₁₀ == 0 && return ""
+    u_label = replace(string(round(u₁₀; digits = 1)), "-" => "m", "." => "p")
+    v_label = replace(string(round(v₁₀; digits = 1)), "-" => "m", "." => "p")
+    return string("_u", u_label, "_v", v_label, "ms")
+end
+
+function duration_suffix(seconds)
+    isinteger(seconds / 3600) && return string(Int(seconds / 3600), "h")
+    return string(Int(round(seconds)), "s")
+end
+
+filename = string("MAMD_WB400_Santee10_Nx_", Nx,
+                  "_Ny_", Ny,
+                  "_Nz_", Nz,
+                  "_spacing_", Int(inlet_center_spacing), "m_",
+                  wind_speed_suffix(U₁₀, V₁₀))
+FILE_DIR = joinpath("/mnt/workdir/jliu1/FFTPCG/Data", filename)
 mkpath(FILE_DIR)
 
 #####
@@ -143,9 +237,21 @@ end
     return -inlet_speed_profile(x, z)
 end
 
+@inline function wind_ramp(t)
+    WIND_RAMP_TIME <= 0 && return 1.0
+    η = clamp(t / WIND_RAMP_TIME, 0.0, 1.0)
+    return η^2 * (3 - 2η)
+end
+
+@inline u_wind_stress(x, y, t) = wind_ramp(t) * Qx_wind
+@inline v_wind_stress(x, y, t) = wind_ramp(t) * Qy_wind
+
+@inline santee_buoyancy_profile(z) = river_bottom_buoyancy + santee_N² * (z + inlet_depth)
+@inline winyah_buoyancy_profile(z) = river_bottom_buoyancy + winyah_N² * (z + inlet_depth)
+
 @inline function river_buoyancy_profile(x, z)
-    in_left_embayment(x) && return santee_surface_buoyancy + santee_N² * z
-    in_right_embayment(x) && return winyah_surface_buoyancy + winyah_N² * z
+    in_left_embayment(x) && return santee_buoyancy_profile(z)
+    in_right_embayment(x) && return winyah_buoyancy_profile(z)
     return ambient_buoyancy(z)
 end
 
@@ -175,20 +281,39 @@ end
     return η^2 * (3 - 2η)
 end
 
-@inline function river_to_mouth_buoyancy_weight(x, y, z)
-    in_channel = in_embayment(x) && river_mouth_y <= y <= y₁
-    in_channel || return 0.0
+@inline function river_to_shelf_buoyancy_weight(x, y, z, channel_center)
     is_wet(x, y, z) || return 0.0
+    z >= -inlet_depth || return 0.0
 
-    η = (y - river_mouth_y) / embayment_length_y
-    return smoothstep(η)
+    # Smooth across each channel edge. The taper is centered on the nominal
+    # channel boundary so that its effective width remains inlet_width.
+    inner_half_width = inlet_width / 2 - channel_edge_transition_width / 2
+    cross_channel_coordinate = (abs(x - channel_center) - inner_half_width) /
+                               channel_edge_transition_width
+    cross_channel_weight = 1 - smoothstep(cross_channel_coordinate)
+
+    # Full river water at the northern inlet transitions smoothly through the
+    # channel and across the mouth, reaching ambient shelf water 1 km offshore.
+    shelfward_edge = river_mouth_y - river_shelf_transition_length
+    along_channel_coordinate = (y - shelfward_edge) / (y₁ - shelfward_edge)
+    along_channel_weight = smoothstep(along_channel_coordinate)
+
+    return cross_channel_weight * along_channel_weight
 end
 
 @inline function b_initial(x, y, z)
     background = ambient_buoyancy(z)
-    river_weight = river_to_mouth_buoyancy_weight(x, y, z)
-    river_buoyancy = river_buoyancy_profile(x, z)
-    return background + river_weight * (river_buoyancy - background) + initial_buoyancy_noise * rand()
+    santee_weight = river_to_shelf_buoyancy_weight(x, y, z, inlet_centers[1])
+    winyah_weight = river_to_shelf_buoyancy_weight(x, y, z, inlet_centers[2])
+
+    santee_anomaly = santee_buoyancy_profile(z) - background
+    winyah_anomaly = winyah_buoyancy_profile(z) - background
+    bottom_noise_weight = smoothstep((z - bathymetry(x, y)) / Δz)
+
+    return background +
+           santee_weight * santee_anomaly +
+           winyah_weight * winyah_anomaly +
+           bottom_noise_weight * initial_buoyancy_noise * rand()
 end
 
 grid = RectilinearGrid(arch, Float64,
@@ -212,13 +337,17 @@ c_winyah_north_bc = ValueBoundaryCondition(c_winyah_inflow_profile)
 
 quadratic_drag = BulkDrag(coefficient = Cd)
 no_slip_bc = ValueBoundaryCondition(0)
+u_wind_bc = FluxBoundaryCondition(u_wind_stress)
+v_wind_bc = FluxBoundaryCondition(v_wind_stress)
 
 u_bcs = FieldBoundaryConditions(immersed = quadratic_drag,
                                 bottom = quadratic_drag,
+                                top = u_wind_bc,
                                 north = no_slip_bc,
                                 west = u_west_bc)
 v_bcs = FieldBoundaryConditions(immersed = quadratic_drag,
                                 bottom = quadratic_drag,
+                                top = v_wind_bc,
                                 north = v_north_bc)
 w_bcs = FieldBoundaryConditions(north = no_slip_bc)
 b_bcs = FieldBoundaryConditions(north = b_north_bc)
@@ -408,7 +537,7 @@ function save_initial_plots!(model)
     return nothing
 end
 
-save_initial_plots!(model)
+args["plot-only"] || save_initial_plots!(model)
 
 if args["setup-only"]
     @info string("Setup complete. Initial condition plots saved in ", FILE_DIR, ".")
@@ -423,7 +552,7 @@ stop_time = args["stop-time"]
 Δt = 1
 
 simulation = Simulation(model; Δt, stop_time)
-time_wizard = TimeStepWizard(cfl = 0.3, max_change = 1.05, max_Δt = 5.0)
+time_wizard = TimeStepWizard(cfl = 0.3, max_change = 1.05, max_Δt = 10.0)
 simulation.callbacks[:wizard] = Callback(time_wizard, IterationInterval(1))
 
 u, v, w = model.velocities
@@ -480,11 +609,19 @@ end
 
 simulation.callbacks[:progress] = Callback(progress, IterationInterval(5))
 
-simulation.output_writers[:jld2] = JLD2Writer(model, (; b, c_santee, c_winyah);
-                                              filename = joinpath(FILE_DIR, "instantaneous_fields.jld2"),
-                                              schedule = TimeInterval(1hour),
-                                              with_halos = true,
-                                              overwrite_existing = true)
+if !args["plot-only"]
+    simulation.output_writers[:jld2] = JLD2Writer(model, (; b, c_santee, c_winyah);
+                                                  filename = joinpath(FILE_DIR, "instantaneous_fields.jld2"),
+                                                  schedule = TimeInterval(1hour),
+                                                  with_halos = true,
+                                                  overwrite_existing = PICKUP === false)
+
+    simulation.output_writers[:checkpointer] = Checkpointer(model;
+                                                            dir = FILE_DIR,
+                                                            prefix = "checkpoint",
+                                                            schedule = TimeInterval(args["checkpoint-interval"]),
+                                                            overwrite_existing = true)
+end
 
 function nearest_index(nodes, value)
     return argmin(abs.(nodes .- value))
@@ -506,13 +643,16 @@ function save_surface_buoyancy_animation()
     zC = z_m
     times = b_data.times
 
+    k_surface = length(z_m)
     j_river_mouth = nearest_index(y_m, river_mouth_y)
-    j_y0 = nearest_index(y_m, 0.0)
+    j_y5 = nearest_index(y_m, 5e3)
     j_ymin = 1
+    i_left_channel = nearest_index(x_m, inlet_centers[1])
+    i_right_channel = nearest_index(x_m, inlet_centers[2])
     buoyancy_colorrange = plume_surface_buoyancy
     colorrange = (-buoyancy_colorrange, buoyancy_colorrange)
 
-    fig = Figure(size = (1500, 1100), fontsize = 18)
+    fig = Figure(size = (1700, 1500), fontsize = 18)
 
     ax_xy = Axis(fig[1, 1],
                  title = "Surface buoyancy",
@@ -525,8 +665,8 @@ function save_surface_buoyancy_animation()
                     xlabel = "x (km)",
                     ylabel = "z (m)")
 
-    ax_y0 = Axis(fig[2, 1],
-                 title = string("x-z buoyancy at y = ", round(y_m[j_y0] / 1e3; digits = 2), " km"),
+    ax_y5 = Axis(fig[2, 1],
+                 title = string("x-z buoyancy at y = ", round(y_m[j_y5] / 1e3; digits = 2), " km"),
                  xlabel = "x (km)",
                  ylabel = "z (m)")
 
@@ -535,28 +675,53 @@ function save_surface_buoyancy_animation()
                    xlabel = "x (km)",
                    ylabel = "z (m)")
 
+    ax_yz_left = Axis(fig[3, 1],
+                      title = string("y-z buoyancy, Santee channel x = ", round(x_m[i_left_channel] / 1e3; digits = 2), " km"),
+                      xlabel = "y (km)",
+                      ylabel = "z (m)")
+
+    ax_yz_right = Axis(fig[3, 2],
+                       title = string("y-z buoyancy, Winyah channel x = ", round(x_m[i_right_channel] / 1e3; digits = 2), " km"),
+                       xlabel = "y (km)",
+                       ylabel = "z (m)")
+
     n = Observable(1)
 
     b_surface = lift(n) do nn
-        Array(interior(b_data[nn], :, :, Nz))
+        Array(interior(b_data[nn], :, :, k_surface))
     end
 
     b_xz_river = lift(n) do nn
         Array(interior(b_data[nn], :, j_river_mouth, :))
     end
 
-    b_xz_y0 = lift(n) do nn
-        Array(interior(b_data[nn], :, j_y0, :))
+    b_xz_y5 = lift(n) do nn
+        Array(interior(b_data[nn], :, j_y5, :))
     end
 
     b_xz_ymin = lift(n) do nn
         Array(interior(b_data[nn], :, j_ymin, :))
     end
 
+    b_yz_left = lift(n) do nn
+        Array(interior(b_data[nn], i_left_channel, :, :))
+    end
+
+    b_yz_right = lift(n) do nn
+        Array(interior(b_data[nn], i_right_channel, :, :))
+    end
+
     hm_xy = heatmap!(ax_xy, xC, yC, b_surface; colormap = :balance, colorrange)
     heatmap!(ax_river, xC, zC, b_xz_river; colormap = :balance, colorrange)
-    heatmap!(ax_y0, xC, zC, b_xz_y0; colormap = :balance, colorrange)
+    heatmap!(ax_y5, xC, zC, b_xz_y5; colormap = :balance, colorrange)
     heatmap!(ax_ymin, xC, zC, b_xz_ymin; colormap = :balance, colorrange)
+    heatmap!(ax_yz_left, yC, zC, b_yz_left; colormap = :balance, colorrange)
+    heatmap!(ax_yz_right, yC, zC, b_yz_right; colormap = :balance, colorrange)
+
+    lines!(ax_yz_left, yC, [bathymetry(x_m[i_left_channel], y) for y in y_m]; color = :black, linewidth = 3)
+    lines!(ax_yz_right, yC, [bathymetry(x_m[i_right_channel], y) for y in y_m]; color = :black, linewidth = 3)
+    vlines!(ax_yz_left, [river_mouth_y / 1e3]; color = :black, linewidth = 2, linestyle = :dot)
+    vlines!(ax_yz_right, [river_mouth_y / 1e3]; color = :black, linewidth = 2, linestyle = :dot)
 
     Colorbar(fig[:, 3], hm_xy; label = "Buoyancy")
 
@@ -589,12 +754,15 @@ function save_surface_tracer_animation()
     zC = z_m
     times = c_santee_data.times
 
+    k_surface = length(z_m)
     j_river_mouth = nearest_index(y_m, river_mouth_y)
-    j_y0 = nearest_index(y_m, 0.0)
+    j_y5 = nearest_index(y_m, 5e3)
     j_ymin = 1
+    i_left_channel = nearest_index(x_m, inlet_centers[1])
+    i_right_channel = nearest_index(x_m, inlet_centers[2])
     colorrange = (0.0, 1.0)
 
-    fig = Figure(size = (1650, 1100), fontsize = 18)
+    fig = Figure(size = (1850, 1500), fontsize = 18)
 
     ax_xy = Axis(fig[1, 1],
                  title = "Surface tracer concentration",
@@ -607,8 +775,8 @@ function save_surface_tracer_animation()
                     xlabel = "x (km)",
                     ylabel = "z (m)")
 
-    ax_y0 = Axis(fig[2, 1],
-                 title = string("x-z tracer concentration at y = ", round(y_m[j_y0] / 1e3; digits = 2), " km"),
+    ax_y5 = Axis(fig[2, 1],
+                 title = string("x-z tracer concentration at y = ", round(y_m[j_y5] / 1e3; digits = 2), " km"),
                  xlabel = "x (km)",
                  ylabel = "z (m)")
 
@@ -617,14 +785,24 @@ function save_surface_tracer_animation()
                    xlabel = "x (km)",
                    ylabel = "z (m)")
 
+    ax_yz_left = Axis(fig[3, 1],
+                      title = string("y-z tracers, Santee channel x = ", round(x_m[i_left_channel] / 1e3; digits = 2), " km"),
+                      xlabel = "y (km)",
+                      ylabel = "z (m)")
+
+    ax_yz_right = Axis(fig[3, 2],
+                       title = string("y-z tracers, Winyah channel x = ", round(x_m[i_right_channel] / 1e3; digits = 2), " km"),
+                       xlabel = "y (km)",
+                       ylabel = "z (m)")
+
     n = Observable(1)
 
     c_santee_surface = lift(n) do nn
-        Array(interior(c_santee_data[nn], :, :, Nz))
+        Array(interior(c_santee_data[nn], :, :, k_surface))
     end
 
     c_winyah_surface = lift(n) do nn
-        Array(interior(c_winyah_data[nn], :, :, Nz))
+        Array(interior(c_winyah_data[nn], :, :, k_surface))
     end
 
     c_santee_xz_river = lift(n) do nn
@@ -635,12 +813,12 @@ function save_surface_tracer_animation()
         Array(interior(c_winyah_data[nn], :, j_river_mouth, :))
     end
 
-    c_santee_xz_y0 = lift(n) do nn
-        Array(interior(c_santee_data[nn], :, j_y0, :))
+    c_santee_xz_y5 = lift(n) do nn
+        Array(interior(c_santee_data[nn], :, j_y5, :))
     end
 
-    c_winyah_xz_y0 = lift(n) do nn
-        Array(interior(c_winyah_data[nn], :, j_y0, :))
+    c_winyah_xz_y5 = lift(n) do nn
+        Array(interior(c_winyah_data[nn], :, j_y5, :))
     end
 
     c_santee_xz_ymin = lift(n) do nn
@@ -651,15 +829,40 @@ function save_surface_tracer_animation()
         Array(interior(c_winyah_data[nn], :, j_ymin, :))
     end
 
+    c_santee_yz_left = lift(n) do nn
+        Array(interior(c_santee_data[nn], i_left_channel, :, :))
+    end
+
+    c_winyah_yz_left = lift(n) do nn
+        Array(interior(c_winyah_data[nn], i_left_channel, :, :))
+    end
+
+    c_santee_yz_right = lift(n) do nn
+        Array(interior(c_santee_data[nn], i_right_channel, :, :))
+    end
+
+    c_winyah_yz_right = lift(n) do nn
+        Array(interior(c_winyah_data[nn], i_right_channel, :, :))
+    end
+
     hm_santee = heatmap!(ax_xy, xC, yC, c_santee_surface; colormap = :viridis, colorrange, alpha = 0.72)
     hm_winyah = heatmap!(ax_xy, xC, yC, c_winyah_surface; colormap = :magma, colorrange, alpha = 0.62)
 
     heatmap!(ax_river, xC, zC, c_santee_xz_river; colormap = :viridis, colorrange, alpha = 0.72)
     heatmap!(ax_river, xC, zC, c_winyah_xz_river; colormap = :magma, colorrange, alpha = 0.62)
-    heatmap!(ax_y0, xC, zC, c_santee_xz_y0; colormap = :viridis, colorrange, alpha = 0.72)
-    heatmap!(ax_y0, xC, zC, c_winyah_xz_y0; colormap = :magma, colorrange, alpha = 0.62)
+    heatmap!(ax_y5, xC, zC, c_santee_xz_y5; colormap = :viridis, colorrange, alpha = 0.72)
+    heatmap!(ax_y5, xC, zC, c_winyah_xz_y5; colormap = :magma, colorrange, alpha = 0.62)
     heatmap!(ax_ymin, xC, zC, c_santee_xz_ymin; colormap = :viridis, colorrange, alpha = 0.72)
     heatmap!(ax_ymin, xC, zC, c_winyah_xz_ymin; colormap = :magma, colorrange, alpha = 0.62)
+    heatmap!(ax_yz_left, yC, zC, c_santee_yz_left; colormap = :viridis, colorrange, alpha = 0.72)
+    heatmap!(ax_yz_left, yC, zC, c_winyah_yz_left; colormap = :magma, colorrange, alpha = 0.62)
+    heatmap!(ax_yz_right, yC, zC, c_santee_yz_right; colormap = :viridis, colorrange, alpha = 0.72)
+    heatmap!(ax_yz_right, yC, zC, c_winyah_yz_right; colormap = :magma, colorrange, alpha = 0.62)
+
+    lines!(ax_yz_left, yC, [bathymetry(x_m[i_left_channel], y) for y in y_m]; color = :black, linewidth = 3)
+    lines!(ax_yz_right, yC, [bathymetry(x_m[i_right_channel], y) for y in y_m]; color = :black, linewidth = 3)
+    vlines!(ax_yz_left, [river_mouth_y / 1e3]; color = :black, linewidth = 2, linestyle = :dot)
+    vlines!(ax_yz_right, [river_mouth_y / 1e3]; color = :black, linewidth = 2, linestyle = :dot)
 
     Colorbar(fig[:, 3], hm_santee; label = "Santee tracer")
     Colorbar(fig[:, 4], hm_winyah; label = "Winyah tracer")
@@ -784,6 +987,209 @@ function save_3d_tracer_animation()
     return nothing
 end
 
+function density_points(b_snapshot, x_m, y_m, z_m; threshold = 0.05, stride = 2)
+    B = Array(interior(b_snapshot, :, :, :))
+
+    xs = Float64[]
+    ys = Float64[]
+    zs = Float64[]
+    ρs = Float64[]
+
+    for k in firstindex(z_m):stride:lastindex(z_m),
+        j in firstindex(y_m):stride:lastindex(y_m),
+        i in firstindex(x_m):stride:lastindex(x_m)
+
+        is_wet(x_m[i], y_m[j], z_m[k]) || continue
+        ρ_anomaly = -ρ₀ * (B[i, j, k] - ambient_buoyancy(z_m[k])) / 9.81
+        if abs(ρ_anomaly) >= threshold
+            push!(xs, x_m[i] / 1e3)
+            push!(ys, y_m[j] / 1e3)
+            push!(zs, z_m[k])
+            push!(ρs, ρ_anomaly)
+        end
+    end
+
+    return xs, ys, zs, ρs
+end
+
+function save_3d_density_animation()
+    filepath = joinpath(FILE_DIR, "instantaneous_fields.jld2")
+    b_data = FieldTimeSeries(filepath, "b")
+    Nt = length(b_data.times)
+
+    Nt == 0 && return nothing
+
+    x_m = collect(xnodes(b_data.grid, Center()))
+    y_m = collect(ynodes(b_data.grid, Center()))
+    z_m = collect(znodes(b_data.grid, Center()))
+
+    xC = x_m ./ 1e3
+    yC = y_m ./ 1e3
+    zC = z_m
+    times = b_data.times
+
+    bottom = [bathymetry(x, y) for x in x_m, y in y_m]
+
+    fig = Figure(size = (1300, 900), fontsize = 18)
+    ax = Axis3(fig[1, 1],
+               title = "3D density anomaly plume",
+               xlabel = "x (km)",
+               ylabel = "y (km)",
+               zlabel = "z (m)",
+               azimuth = 0.7pi,
+               elevation = 0.18pi,
+               aspect = (1, 1, 0.45))
+
+    surface!(ax, xC, yC, bottom; colormap = :deep, colorrange = (-slope_depth, 0), alpha = 0.55, transparency = true)
+
+    xs0, ys0, zs0, ρs0 = density_points(b_data[1], x_m, y_m, z_m)
+
+    xs = Observable(xs0)
+    ys = Observable(ys0)
+    zs = Observable(zs0)
+    ρs = Observable(ρs0)
+
+    density_plume = scatter!(ax, xs, ys, zs;
+                             color = ρs,
+                             colormap = :balance,
+                             colorrange = (-12.0, 12.0),
+                             markersize = 9,
+                             alpha = 0.7,
+                             transparency = true)
+
+    Colorbar(fig[1, 2], density_plume; label = "Density anomaly (kg m⁻³)")
+
+    time_label = Observable(string("t = ", round(times[1] / 3600; digits = 1), " hour"))
+    Label(fig[0, :], time_label, fontsize = 22)
+
+    xlims!(ax, extrema(xC)...)
+    ylims!(ax, extrema(yC)...)
+    zlims!(ax, -slope_depth, 5)
+
+    CairoMakie.record(fig, joinpath(FILE_DIR, "density_3d.mp4"), 1:Nt; framerate = 6) do nn
+        new_xs, new_ys, new_zs, new_ρs = density_points(b_data[nn], x_m, y_m, z_m)
+        xs[] = new_xs
+        ys[] = new_ys
+        zs[] = new_zs
+        ρs[] = new_ρs
+        time_label[] = string("t = ", round(times[nn] / 3600; digits = 1), " hour")
+    end
+
+    return nothing
+end
+
+function save_3d_buoyancy_animation()
+    filepath = joinpath(FILE_DIR, "instantaneous_fields.jld2")
+    b_data = FieldTimeSeries(filepath, "b")
+    Nt = length(b_data.times)
+
+    Nt == 0 && return nothing
+
+    x_m = collect(xnodes(b_data.grid, Center()))
+    y_m = collect(ynodes(b_data.grid, Center()))
+    z_m = collect(znodes(b_data.grid, Center()))
+
+    xC = x_m ./ 1e3
+    yC = y_m ./ 1e3
+    zC = z_m
+    times = b_data.times
+
+    j_mouth = nearest_index(y_m, river_mouth_y)
+    j_y5 = nearest_index(y_m, 5e3)
+    k_surface = length(z_m)
+
+    bottom = [bathymetry(x, y) for x in x_m, y in y_m]
+    Xxy = [x for x in xC, y in yC]
+    Yxy = [y for x in xC, y in yC]
+    Zsurface = fill(0.5, length(xC), length(yC))
+
+    Xxz = [x for x in xC, z in zC]
+    Zxz = [z for x in xC, z in zC]
+    Ymouth = fill(yC[j_mouth], length(xC), length(zC))
+    Yy5 = fill(yC[j_y5], length(xC), length(zC))
+
+    function masked_surface(snapshot)
+        values = Array(interior(snapshot, :, :, k_surface))
+        for j in eachindex(y_m), i in eachindex(x_m)
+            is_wet(x_m[i], y_m[j], z_m[k_surface]) || (values[i, j] = NaN)
+        end
+        return values
+    end
+
+    function masked_xz(snapshot, j)
+        values = Array(interior(snapshot, :, j, :))
+        for k in eachindex(z_m), i in eachindex(x_m)
+            is_wet(x_m[i], y_m[j], z_m[k]) || (values[i, k] = NaN)
+        end
+        return values
+    end
+
+    b_surface = Observable(masked_surface(b_data[1]))
+    b_mouth = Observable(masked_xz(b_data[1], j_mouth))
+    b_y5 = Observable(masked_xz(b_data[1], j_y5))
+
+    fig = Figure(size = (1400, 900), fontsize = 18)
+    ax = Axis3(fig[1, 1],
+               title = "3D buoyancy faces",
+               xlabel = "x (km)",
+               ylabel = "y (km)",
+               zlabel = "z (m)",
+               azimuth = 0.7pi,
+               elevation = 0.18pi,
+               aspect = (1, 1, 0.45))
+
+    surface!(ax, xC, yC, bottom;
+             colormap = :deep,
+             colorrange = (-slope_depth, 0),
+             alpha = 0.35,
+             transparency = true)
+
+    buoyancy_colorrange = plume_surface_buoyancy
+    colorrange = (-buoyancy_colorrange, buoyancy_colorrange)
+
+    buoyancy_face = surface!(ax, Xxy, Yxy, Zsurface;
+                             color = b_surface,
+                             colormap = :balance,
+                             colorrange,
+                             nan_color = :transparent,
+                             alpha = 0.72,
+                             transparency = true)
+
+    surface!(ax, Xxz, Ymouth, Zxz;
+             color = b_mouth,
+             colormap = :balance,
+             colorrange,
+             nan_color = :transparent,
+             alpha = 0.72,
+             transparency = true)
+
+    surface!(ax, Xxz, Yy5, Zxz;
+             color = b_y5,
+             colormap = :balance,
+             colorrange,
+             nan_color = :transparent,
+             alpha = 0.62,
+             transparency = true)
+
+    Colorbar(fig[1, 2], buoyancy_face; label = "Buoyancy")
+
+    time_label = Observable(string("t = ", round(times[1] / 3600; digits = 1), " hour"))
+    Label(fig[0, :], time_label, fontsize = 22)
+
+    xlims!(ax, extrema(xC)...)
+    ylims!(ax, extrema(yC)...)
+    zlims!(ax, -slope_depth, 5)
+
+    CairoMakie.record(fig, joinpath(FILE_DIR, "buoyancy_3d.mp4"), 1:Nt; framerate = 6) do nn
+        b_surface[] = masked_surface(b_data[nn])
+        b_mouth[] = masked_xz(b_data[nn], j_mouth)
+        b_y5[] = masked_xz(b_data[nn], j_y5)
+        time_label[] = string("t = ", round(times[nn] / 3600; digits = 1), " hour")
+    end
+
+    return nothing
+end
+
 function save_3d_tracer_contour_animation()
     filepath = joinpath(FILE_DIR, "instantaneous_fields.jld2")
     c_santee_data = FieldTimeSeries(filepath, "c_santee")
@@ -803,7 +1209,7 @@ function save_3d_tracer_contour_animation()
 
     bottom = [bathymetry(x, y) for x in x_m, y in y_m]
     j_mouth = nearest_index(y_m, river_mouth_y)
-    j_y0 = nearest_index(y_m, 0.0)
+    j_y5 = nearest_index(y_m, 5e3)
 
     Xxy = [x for x in xC, y in yC]
     Yxy = [y for x in xC, y in yC]
@@ -812,7 +1218,13 @@ function save_3d_tracer_contour_animation()
     Xxz = [x for x in xC, z in zC]
     Zxz = [z for x in xC, z in zC]
     Ymouth = fill(yC[j_mouth], length(xC), length(zC))
-    Ymid = fill(yC[j_y0], length(xC), length(zC))
+    Yy5 = fill(yC[j_y5], length(xC), length(zC))
+
+    function mask_absent_tracer(data; cutoff = 1e-6)
+        masked = Array(data)
+        masked[masked .<= cutoff] .= NaN
+        return masked
+    end
 
     fig = Figure(size = (1400, 900), fontsize = 18)
     ax = Axis3(fig[1, 1],
@@ -826,17 +1238,18 @@ function save_3d_tracer_contour_animation()
 
     surface!(ax, xC, yC, bottom; colormap = :deep, colorrange = (-slope_depth, 0), alpha = 0.35, transparency = true)
 
-    c_santee_surface = Observable(Array(interior(c_santee_data[1], :, :, Nz)))
-    c_winyah_surface = Observable(Array(interior(c_winyah_data[1], :, :, Nz)))
-    c_santee_mouth = Observable(Array(interior(c_santee_data[1], :, j_mouth, :)))
-    c_winyah_mouth = Observable(Array(interior(c_winyah_data[1], :, j_mouth, :)))
-    c_santee_mid = Observable(Array(interior(c_santee_data[1], :, j_y0, :)))
-    c_winyah_mid = Observable(Array(interior(c_winyah_data[1], :, j_y0, :)))
+    c_santee_surface = Observable(mask_absent_tracer(interior(c_santee_data[1], :, :, Nz)))
+    c_winyah_surface = Observable(mask_absent_tracer(interior(c_winyah_data[1], :, :, Nz)))
+    c_santee_mouth = Observable(mask_absent_tracer(interior(c_santee_data[1], :, j_mouth, :)))
+    c_winyah_mouth = Observable(mask_absent_tracer(interior(c_winyah_data[1], :, j_mouth, :)))
+    c_santee_y5 = Observable(mask_absent_tracer(interior(c_santee_data[1], :, j_y5, :)))
+    c_winyah_y5 = Observable(mask_absent_tracer(interior(c_winyah_data[1], :, j_y5, :)))
 
     santee_face = surface!(ax, Xxy, Yxy, Zsurface;
                            color = c_santee_surface,
                            colormap = :viridis,
                            colorrange = (0.0, 1.0),
+                           nan_color = :transparent,
                            alpha = 0.62,
                            transparency = true)
 
@@ -844,6 +1257,7 @@ function save_3d_tracer_contour_animation()
                            color = c_winyah_surface,
                            colormap = :magma,
                            colorrange = (0.0, 1.0),
+                           nan_color = :transparent,
                            alpha = 0.52,
                            transparency = true)
 
@@ -851,6 +1265,7 @@ function save_3d_tracer_contour_animation()
              color = c_santee_mouth,
              colormap = :viridis,
              colorrange = (0.0, 1.0),
+             nan_color = :transparent,
              alpha = 0.68,
              transparency = true)
 
@@ -858,20 +1273,23 @@ function save_3d_tracer_contour_animation()
              color = c_winyah_mouth,
              colormap = :magma,
              colorrange = (0.0, 1.0),
+             nan_color = :transparent,
              alpha = 0.58,
              transparency = true)
 
-    surface!(ax, Xxz, Ymid, Zxz;
-             color = c_santee_mid,
+    surface!(ax, Xxz, Yy5, Zxz;
+             color = c_santee_y5,
              colormap = :viridis,
              colorrange = (0.0, 1.0),
+             nan_color = :transparent,
              alpha = 0.52,
              transparency = true)
 
-    surface!(ax, Xxz, Ymid, Zxz;
-             color = c_winyah_mid,
+    surface!(ax, Xxz, Yy5, Zxz;
+             color = c_winyah_y5,
              colormap = :magma,
              colorrange = (0.0, 1.0),
+             nan_color = :transparent,
              alpha = 0.44,
              transparency = true)
 
@@ -886,20 +1304,35 @@ function save_3d_tracer_contour_animation()
     zlims!(ax, -slope_depth, 5)
 
     CairoMakie.record(fig, joinpath(FILE_DIR, "tracers_3d_contours.mp4"), 1:Nt; framerate = 6) do nn
-        c_santee_surface[] = Array(interior(c_santee_data[nn], :, :, Nz))
-        c_winyah_surface[] = Array(interior(c_winyah_data[nn], :, :, Nz))
-        c_santee_mouth[] = Array(interior(c_santee_data[nn], :, j_mouth, :))
-        c_winyah_mouth[] = Array(interior(c_winyah_data[nn], :, j_mouth, :))
-        c_santee_mid[] = Array(interior(c_santee_data[nn], :, j_y0, :))
-        c_winyah_mid[] = Array(interior(c_winyah_data[nn], :, j_y0, :))
+        c_santee_surface[] = mask_absent_tracer(interior(c_santee_data[nn], :, :, Nz))
+        c_winyah_surface[] = mask_absent_tracer(interior(c_winyah_data[nn], :, :, Nz))
+        c_santee_mouth[] = mask_absent_tracer(interior(c_santee_data[nn], :, j_mouth, :))
+        c_winyah_mouth[] = mask_absent_tracer(interior(c_winyah_data[nn], :, j_mouth, :))
+        c_santee_y5[] = mask_absent_tracer(interior(c_santee_data[nn], :, j_y5, :))
+        c_winyah_y5[] = mask_absent_tracer(interior(c_winyah_data[nn], :, j_y5, :))
         time_label[] = string("t = ", round(times[nn] / 3600; digits = 1), " hour")
     end
 
     return nothing
 end
 
-run!(simulation)
-save_surface_buoyancy_animation()
-save_surface_tracer_animation()
-save_3d_tracer_animation()
-save_3d_tracer_contour_animation()
+if args["plot-only"]
+    data_file = joinpath(FILE_DIR, "instantaneous_fields.jld2")
+    isfile(data_file) || error("Cannot plot because data file does not exist: $data_file")
+    @info "Plot-only mode: skipping simulation and reading existing data" data_file
+else
+    run!(simulation; pickup = PICKUP, checkpoint_at_end = true)
+end
+
+if args["contours-only"]
+    save_3d_tracer_contour_animation()
+elseif args["buoyancy-3d-only"]
+    save_3d_buoyancy_animation()
+else
+    save_surface_buoyancy_animation()
+    save_surface_tracer_animation()
+    save_3d_tracer_animation()
+    save_3d_density_animation()
+    save_3d_buoyancy_animation()
+    save_3d_tracer_contour_animation()
+end

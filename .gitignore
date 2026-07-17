@@ -39,6 +39,7 @@ JuliaLocalPreferences.toml
 *.data
 *.nc
 *.jld2
+*.out
 
 # Checkpointer model serialization
 *.jlser
