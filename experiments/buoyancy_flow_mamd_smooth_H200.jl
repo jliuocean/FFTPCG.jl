@@ -23,6 +23,12 @@ function parse_commandline()
         "--setup-only"
             help = "Build the model and save initial condition plots without running the simulation"
             action = :store_true
+        "--jetty-geometry"
+            help = "Use the 40 km domain with 3 km Winyah jetties and a 3 km Santee navigation channel"
+            action = :store_true
+        "--south-outflow"
+            help = "Balance river inflow through the south boundary instead of the west boundary"
+            action = :store_true
         "--plot-only"
             help = "Skip the simulation and regenerate animations from an existing instantaneous_fields.jld2"
             action = :store_true
@@ -32,10 +38,16 @@ function parse_commandline()
         "--buoyancy-3d-only"
             help = "With --plot-only, regenerate only buoyancy_3d.mp4"
             action = :store_true
+        "--surface-tracers-only"
+            help = "With --plot-only, regenerate only surface_tracers_xy.mp4"
+            action = :store_true
+        "--santee-3d-only"
+            help = "With --plot-only, generate only santee_tracer_3d.mp4"
+            action = :store_true
         "--stop-time"
             help = "Simulation stop time in seconds"
             arg_type = Float64
-            default = 86400.0
+            default = 367200.0
         "--pickup"
             help = "Checkpoint restart mode: false, true/latest/recent/highest, iteration number, or checkpoint filepath"
             arg_type = String
@@ -53,9 +65,13 @@ function parse_commandline()
             arg_type = Float64
             default = 0.0
         "--wind-ramp-time"
-            help = "Wind ramp-up time in seconds"
+            help = "Wind-speed ramp-up duration in seconds"
             arg_type = Float64
             default = 21600.0
+        "--wind-start-time"
+            help = "Time in seconds when the wind-speed ramp begins"
+            arg_type = Float64
+            default = 172800.0
     end
 
     return parse_args(s)
@@ -80,19 +96,25 @@ args = parse_commandline()
 args["setup-only"] && args["plot-only"] && error("--setup-only and --plot-only cannot be used together")
 args["contours-only"] && !args["plot-only"] && error("--contours-only requires --plot-only")
 args["buoyancy-3d-only"] && !args["plot-only"] && error("--buoyancy-3d-only requires --plot-only")
-args["contours-only"] && args["buoyancy-3d-only"] && error("Choose only one plot-only target")
+args["surface-tracers-only"] && !args["plot-only"] && error("--surface-tracers-only requires --plot-only")
+args["santee-3d-only"] && !args["plot-only"] && error("--santee-3d-only requires --plot-only")
+plot_only_targets = (args["contours-only"], args["buoyancy-3d-only"],
+                     args["surface-tracers-only"], args["santee-3d-only"])
+count(identity, plot_only_targets) > 1 && error("Choose only one plot-only target")
 const ARCH = uppercase(args["arch"])
 ARCH in ("GPU", "CPU") || error("Invalid --arch $(ARCH); must be GPU or CPU")
 
 arch = ARCH == "GPU" ? GPU() : CPU()
 
 const PICKUP = parse_pickup_argument(args["pickup"])
+const JETTY_GEOMETRY = args["jetty-geometry"]
+const SOUTH_OUTFLOW = args["south-outflow"]
 
 #####
 ##### Domain and buoyant inflow parameters
 #####
 
-const Lx = 25e3
+const Lx = JETTY_GEOMETRY ? 40e3 : 25e3
 const Ly = 15e3
 const Lz = 20.0
 
@@ -117,17 +139,20 @@ const inlet_center_spacing = 10e3
 const inlet_centers = (-inlet_center_spacing / 2, inlet_center_spacing / 2)
 const embayment_depth = 5.0
 const inlet_depth = embayment_depth
-const santee_inlet_speed = 0.02
-const winyah_inlet_speed = 0.06
+const santee_discharge = 450.0
+const winyah_discharge = 350.0
+const inlet_cross_sectional_area = inlet_width * inlet_depth
+const santee_inlet_speed = santee_discharge / inlet_cross_sectional_area
+const winyah_inlet_speed = winyah_discharge / inlet_cross_sectional_area
 const shelf_N² = 1e-5
 const N² = shelf_N²
 const river_bottom_buoyancy = -shelf_N² * inlet_depth
-const santee_N² = 2e-2
-const winyah_N² = 1e-2
+const santee_N² = 8e-3
+const winyah_N² = 1.6e-2
 const santee_surface_buoyancy = river_bottom_buoyancy + santee_N² * inlet_depth
 const winyah_surface_buoyancy = river_bottom_buoyancy + winyah_N² * inlet_depth
 const plume_surface_buoyancy = max(santee_surface_buoyancy, winyah_surface_buoyancy)
-const f₀ = 1e-4
+const f₀ = 8e-5
 const Cd = 2e-3
 const ρ₀ = 1025.0
 const ρ_air = 1.225
@@ -136,6 +161,9 @@ const U₁₀ = args["u10"]
 const V₁₀ = args["v10"]
 const U₁₀_magnitude = hypot(U₁₀, V₁₀)
 const WIND_RAMP_TIME = args["wind-ramp-time"]
+const WIND_START_TIME = args["wind-start-time"]
+WIND_START_TIME >= 0 || error("--wind-start-time must be nonnegative")
+WIND_RAMP_TIME >= 0 || error("--wind-ramp-time must be nonnegative")
 # Physical atmospheric wind stress components (Pa).
 const τx_wind = ρ_air * Cᴰ_air * U₁₀_magnitude * U₁₀
 const τy_wind = ρ_air * Cᴰ_air * U₁₀_magnitude * V₁₀
@@ -144,27 +172,48 @@ const τy_wind = ρ_air * Cᴰ_air * U₁₀_magnitude * V₁₀
 const Qx_wind = -τx_wind / ρ₀
 const Qy_wind = -τy_wind / ρ₀
 @info "Full-strength wind forcing" U₁₀ V₁₀ U₁₀_magnitude τx_wind τy_wind Qx_wind Qy_wind
+@info "Wind-speed schedule" WIND_START_TIME WIND_RAMP_TIME full_wind_time = WIND_START_TIME + WIND_RAMP_TIME
 const embayment_length_y = 200.0
 const river_mouth_y = y₁ - embayment_length_y
+const nearshore_slope_length = 3e3
+const nearshore_slope_depth = 5.0
+const jetty_length = 3e3
+const jetty_width = Δx
+const jetty_south_y = river_mouth_y - jetty_length
+const winyah_jetty_x = (inlet_centers[2] - inlet_width / 2,
+                        inlet_centers[2] + inlet_width / 2)
+const santee_channel_length = 3e3
+const santee_channel_south_y = river_mouth_y - santee_channel_length
+const santee_channel_x = (inlet_centers[1] - inlet_width / 2,
+                          inlet_centers[1] + inlet_width / 2)
 const river_shelf_transition_length = 1e3
 const channel_edge_transition_width = 200.0
 const slope_depth = 15.0
 const initial_buoyancy_noise = 1e-6
 
 # Both rivers match the shelf at the channel bottom. Lower buoyancy means
-# denser water; because the profiles share a bottom value and Winyah has the
-# smaller vertical gradient, Winyah is denser everywhere above the bottom.
+# denser water; because the profiles share a bottom value and Santee has the
+# smaller vertical gradient, Santee is denser everywhere above the bottom.
 @assert isapprox(santee_surface_buoyancy - santee_N² * inlet_depth,
                  river_bottom_buoyancy; atol = 10eps(Float64))
 @assert isapprox(winyah_surface_buoyancy - winyah_N² * inlet_depth,
                  river_bottom_buoyancy; atol = 10eps(Float64))
-@assert winyah_surface_buoyancy < santee_surface_buoyancy
-@assert winyah_N² < santee_N²
+@assert santee_surface_buoyancy < winyah_surface_buoyancy
+@assert santee_N² < winyah_N²
 
-const inlet_transport = -inlet_width * inlet_depth * (santee_inlet_speed + winyah_inlet_speed)
+const inlet_transport = -(santee_discharge + winyah_discharge)
+@assert isapprox(inlet_cross_sectional_area * santee_inlet_speed, santee_discharge)
+@assert isapprox(inlet_cross_sectional_area * winyah_inlet_speed, winyah_discharge)
 const shelf_open_boundary_length_y = river_mouth_y - y₀
-const west_outlet_area = 0.5 * (embayment_depth + slope_depth) * shelf_open_boundary_length_y
-const outlet_speed = abs(inlet_transport) / west_outlet_area
+const default_west_outlet_area = 0.5 * (embayment_depth + slope_depth) * shelf_open_boundary_length_y
+const jetty_west_outlet_area = 0.5 * nearshore_slope_depth * nearshore_slope_length +
+                               0.5 * (nearshore_slope_depth + slope_depth) *
+                               (shelf_open_boundary_length_y - nearshore_slope_length)
+const west_outlet_area = JETTY_GEOMETRY ? jetty_west_outlet_area : default_west_outlet_area
+const south_outlet_area = Lx * slope_depth
+const outlet_area = SOUTH_OUTFLOW ? south_outlet_area : west_outlet_area
+const outlet_speed = abs(inlet_transport) / outlet_area
+@info "Compensating outflow" boundary = SOUTH_OUTFLOW ? "south" : "west" outlet_area outlet_speed inlet_transport
 const sponge_width = 2e3
 const sponge_timescale = 30minutes
 const sponge_rate = 1 / sponge_timescale
@@ -186,11 +235,22 @@ function duration_suffix(seconds)
     return string(Int(round(seconds)), "s")
 end
 
-filename = string("MAMD_WB400_Santee10_Nx_", Nx,
+function wind_schedule_suffix(start_time, ramp_time, stop_time)
+    return string("_start", duration_suffix(start_time),
+                  "_ramp", duration_suffix(ramp_time),
+                  "_total", duration_suffix(stop_time))
+end
+
+const geometry_suffix = JETTY_GEOMETRY ? "_Lx40km_WinyahJetty3km_SanteeChannel3km" : "_"
+const outflow_suffix = SOUTH_OUTFLOW ? "_SouthOutflow" : ""
+filename = string("MAMD_Winyah", Int(winyah_discharge),
+                  "_Santee", Int(santee_discharge),
+                  "_Nx_", Nx,
                   "_Ny_", Ny,
                   "_Nz_", Nz,
-                  "_spacing_", Int(inlet_center_spacing), "m_",
-                  wind_speed_suffix(U₁₀, V₁₀))
+                  "_spacing_", Int(inlet_center_spacing), "m", geometry_suffix, outflow_suffix,
+                  wind_speed_suffix(U₁₀, V₁₀),
+                  wind_schedule_suffix(WIND_START_TIME, WIND_RAMP_TIME, args["stop-time"]))
 FILE_DIR = joinpath("/mnt/workdir/jliu1/FFTPCG/Data", filename)
 mkpath(FILE_DIR)
 
@@ -210,13 +270,69 @@ end
 
 @inline in_embayment(x) = in_left_embayment(x) || in_right_embayment(x)
 
-@inline function water_depth(x, y)
+@inline function default_water_depth(x, y)
     if y > river_mouth_y
         return in_embayment(x) ? embayment_depth : 0.0
     else
         slope_fraction = clamp((river_mouth_y - y) / (river_mouth_y - y₀), 0.0, 1.0)
         return embayment_depth + (slope_depth - embayment_depth) * slope_fraction
     end
+end
+
+@inline function in_winyah_jetty(x, y)
+    along_jetty = jetty_south_y <= y <= river_mouth_y
+    on_west_jetty = abs(x - winyah_jetty_x[1]) <= jetty_width / 2
+    on_east_jetty = abs(x - winyah_jetty_x[2]) <= jetty_width / 2
+    return along_jetty && (on_west_jetty || on_east_jetty)
+end
+
+@inline function in_winyah_navigation_channel(x, y)
+    between_jetties = winyah_jetty_x[1] < x < winyah_jetty_x[2]
+    along_jetties = jetty_south_y <= y <= river_mouth_y
+    return between_jetties && along_jetties
+end
+
+@inline function in_santee_navigation_channel(x, y)
+    within_channel = santee_channel_x[1] < x < santee_channel_x[2]
+    along_channel = santee_channel_south_y <= y <= river_mouth_y
+    return within_channel && along_channel
+end
+
+@inline function jetty_shelf_and_channel_depth(x, y)
+    if y > river_mouth_y
+        return in_embayment(x) ? embayment_depth : 0.0
+    end
+
+    offshore_distance = river_mouth_y - y
+    if offshore_distance <= nearshore_slope_length
+        nearshore_fraction = clamp(offshore_distance / nearshore_slope_length, 0.0, 1.0)
+        return nearshore_slope_depth * nearshore_fraction
+    else
+        outer_shelf_length = shelf_open_boundary_length_y - nearshore_slope_length
+        outer_shelf_fraction = clamp((offshore_distance - nearshore_slope_length) /
+                                     outer_shelf_length, 0.0, 1.0)
+        return nearshore_slope_depth +
+               (slope_depth - nearshore_slope_depth) * outer_shelf_fraction
+    end
+end
+
+@inline function jetty_water_depth(x, y)
+    in_winyah_jetty(x, y) && return 0.0
+    in_winyah_navigation_channel(x, y) && return inlet_depth
+    in_santee_navigation_channel(x, y) && return inlet_depth
+    return jetty_shelf_and_channel_depth(x, y)
+end
+
+@inline water_depth(x, y) = JETTY_GEOMETRY ? jetty_water_depth(x, y) : default_water_depth(x, y)
+
+if JETTY_GEOMETRY
+    @assert water_depth(0.0, river_mouth_y) == 0.0
+    @assert water_depth(0.0, river_mouth_y - nearshore_slope_length) == nearshore_slope_depth
+    @assert water_depth(0.0, y₀) == slope_depth
+    @assert water_depth(inlet_centers[2], river_mouth_y) == inlet_depth
+    @assert water_depth(inlet_centers[2], jetty_south_y) == inlet_depth
+    @assert water_depth(inlet_centers[1], river_mouth_y) == inlet_depth
+    @assert water_depth(inlet_centers[1], santee_channel_south_y) == inlet_depth
 end
 
 @inline bathymetry(x, y) = -water_depth(x, y)
@@ -237,14 +353,16 @@ end
     return -inlet_speed_profile(x, z)
 end
 
-@inline function wind_ramp(t)
+@inline function wind_speed_ramp(t)
+    t <= WIND_START_TIME && return 0.0
     WIND_RAMP_TIME <= 0 && return 1.0
-    η = clamp(t / WIND_RAMP_TIME, 0.0, 1.0)
+    η = clamp((t - WIND_START_TIME) / WIND_RAMP_TIME, 0.0, 1.0)
     return η^2 * (3 - 2η)
 end
 
-@inline u_wind_stress(x, y, t) = wind_ramp(t) * Qx_wind
-@inline v_wind_stress(x, y, t) = wind_ramp(t) * Qy_wind
+@inline wind_stress_ramp(t) = wind_speed_ramp(t)^2
+@inline u_wind_stress(x, y, t) = wind_stress_ramp(t) * Qx_wind
+@inline v_wind_stress(x, y, t) = wind_stress_ramp(t) * Qy_wind
 
 @inline santee_buoyancy_profile(z) = river_bottom_buoyancy + santee_N² * (z + inlet_depth)
 @inline winyah_buoyancy_profile(z) = river_bottom_buoyancy + winyah_N² * (z + inlet_depth)
@@ -273,6 +391,7 @@ end
 end
 
 @inline u_west_outflow(y, z, t) = -outlet_speed
+@inline v_south_outflow(x, z, t) = -outlet_speed
 
 @inline ambient_buoyancy(z) = shelf_N² * z
 
@@ -330,6 +449,8 @@ v_north_bc = NormalFlowBoundaryCondition(v_inflow_profile;
                                          scheme = PerturbationAdvection(target_transport = inlet_transport))
 u_west_bc = NormalFlowBoundaryCondition(u_west_outflow;
                                         scheme = PerturbationAdvection())
+v_south_bc = NormalFlowBoundaryCondition(v_south_outflow;
+                                         scheme = PerturbationAdvection())
 
 b_north_bc = ValueBoundaryCondition(b_inflow_profile)
 c_santee_north_bc = ValueBoundaryCondition(c_santee_inflow_profile)
@@ -340,15 +461,27 @@ no_slip_bc = ValueBoundaryCondition(0)
 u_wind_bc = FluxBoundaryCondition(u_wind_stress)
 v_wind_bc = FluxBoundaryCondition(v_wind_stress)
 
-u_bcs = FieldBoundaryConditions(immersed = quadratic_drag,
-                                bottom = quadratic_drag,
-                                top = u_wind_bc,
-                                north = no_slip_bc,
-                                west = u_west_bc)
-v_bcs = FieldBoundaryConditions(immersed = quadratic_drag,
-                                bottom = quadratic_drag,
-                                top = v_wind_bc,
-                                north = v_north_bc)
+if SOUTH_OUTFLOW
+    u_bcs = FieldBoundaryConditions(immersed = quadratic_drag,
+                                    bottom = quadratic_drag,
+                                    top = u_wind_bc,
+                                    north = no_slip_bc)
+    v_bcs = FieldBoundaryConditions(immersed = quadratic_drag,
+                                    bottom = quadratic_drag,
+                                    top = v_wind_bc,
+                                    north = v_north_bc,
+                                    south = v_south_bc)
+else
+    u_bcs = FieldBoundaryConditions(immersed = quadratic_drag,
+                                    bottom = quadratic_drag,
+                                    top = u_wind_bc,
+                                    north = no_slip_bc,
+                                    west = u_west_bc)
+    v_bcs = FieldBoundaryConditions(immersed = quadratic_drag,
+                                    bottom = quadratic_drag,
+                                    top = v_wind_bc,
+                                    north = v_north_bc)
+end
 w_bcs = FieldBoundaryConditions(north = no_slip_bc)
 b_bcs = FieldBoundaryConditions(north = b_north_bc)
 c_santee_bcs = FieldBoundaryConditions(north = c_santee_north_bc)
@@ -363,8 +496,13 @@ boundary_conditions = (u = u_bcs, v = v_bcs, w = w_bcs, b = b_bcs,
     return max(west, east, south)
 end
  sponge_relaxation(x, y, field, target) = -sponge_rate * sponge_mask(x, y) * (field - target)
+ function non_south_sponge_mask(x, y)
+    west = smoothstep((x₀ + sponge_width - x) / sponge_width)
+    east = smoothstep((x - (x₁ - sponge_width)) / sponge_width)
+    return max(west, east)
+end
  u_sponge(x, y, z, t, u) = sponge_relaxation(x, y, u, 0.0)
- v_sponge(x, y, z, t, v) = sponge_relaxation(x, y, v, 0.0)
+ v_sponge(x, y, z, t, v) = -sponge_rate * (SOUTH_OUTFLOW ? non_south_sponge_mask(x, y) : sponge_mask(x, y)) * v
  b_sponge(x, y, z, t, b) = sponge_relaxation(x, y, b, ambient_buoyancy(z))
  c_santee_sponge(x, y, z, t, c_santee) = sponge_relaxation(x, y, c_santee, 0.0)
  c_winyah_sponge(x, y, z, t, c_winyah) = sponge_relaxation(x, y, c_winyah, 0.0)
@@ -762,102 +900,114 @@ function save_surface_tracer_animation()
     i_right_channel = nearest_index(x_m, inlet_centers[2])
     colorrange = (0.0, 1.0)
 
-    fig = Figure(size = (1850, 1500), fontsize = 18)
+    function mask_absent_tracer(data; cutoff = 1e-6)
+        masked = Array(data)
+        masked[masked .<= cutoff] .= NaN
+        return masked
+    end
+
+    fig = Figure(size = (1850, 1500), fontsize = 18, backgroundcolor = :white)
 
     ax_xy = Axis(fig[1, 1],
                  title = "Surface tracer concentration",
                  xlabel = "x (km)",
                  ylabel = "y (km)",
+                 backgroundcolor = :white,
                  aspect = DataAspect())
 
     ax_river = Axis(fig[1, 2],
                     title = string("x-z tracer concentration at river mouth, y = ", round(y_m[j_river_mouth] / 1e3; digits = 2), " km"),
                     xlabel = "x (km)",
-                    ylabel = "z (m)")
+                    ylabel = "z (m)",
+                    backgroundcolor = :white)
 
     ax_y5 = Axis(fig[2, 1],
                  title = string("x-z tracer concentration at y = ", round(y_m[j_y5] / 1e3; digits = 2), " km"),
                  xlabel = "x (km)",
-                 ylabel = "z (m)")
+                 ylabel = "z (m)",
+                 backgroundcolor = :white)
 
     ax_ymin = Axis(fig[2, 2],
                    title = string("x-z tracer concentration at y = ", round(y_m[j_ymin] / 1e3; digits = 2), " km"),
                    xlabel = "x (km)",
-                   ylabel = "z (m)")
+                   ylabel = "z (m)",
+                   backgroundcolor = :white)
 
     ax_yz_left = Axis(fig[3, 1],
                       title = string("y-z tracers, Santee channel x = ", round(x_m[i_left_channel] / 1e3; digits = 2), " km"),
                       xlabel = "y (km)",
-                      ylabel = "z (m)")
+                      ylabel = "z (m)",
+                      backgroundcolor = :white)
 
     ax_yz_right = Axis(fig[3, 2],
                        title = string("y-z tracers, Winyah channel x = ", round(x_m[i_right_channel] / 1e3; digits = 2), " km"),
                        xlabel = "y (km)",
-                       ylabel = "z (m)")
+                       ylabel = "z (m)",
+                       backgroundcolor = :white)
 
     n = Observable(1)
 
     c_santee_surface = lift(n) do nn
-        Array(interior(c_santee_data[nn], :, :, k_surface))
+        mask_absent_tracer(interior(c_santee_data[nn], :, :, k_surface))
     end
 
     c_winyah_surface = lift(n) do nn
-        Array(interior(c_winyah_data[nn], :, :, k_surface))
+        mask_absent_tracer(interior(c_winyah_data[nn], :, :, k_surface))
     end
 
     c_santee_xz_river = lift(n) do nn
-        Array(interior(c_santee_data[nn], :, j_river_mouth, :))
+        mask_absent_tracer(interior(c_santee_data[nn], :, j_river_mouth, :))
     end
 
     c_winyah_xz_river = lift(n) do nn
-        Array(interior(c_winyah_data[nn], :, j_river_mouth, :))
+        mask_absent_tracer(interior(c_winyah_data[nn], :, j_river_mouth, :))
     end
 
     c_santee_xz_y5 = lift(n) do nn
-        Array(interior(c_santee_data[nn], :, j_y5, :))
+        mask_absent_tracer(interior(c_santee_data[nn], :, j_y5, :))
     end
 
     c_winyah_xz_y5 = lift(n) do nn
-        Array(interior(c_winyah_data[nn], :, j_y5, :))
+        mask_absent_tracer(interior(c_winyah_data[nn], :, j_y5, :))
     end
 
     c_santee_xz_ymin = lift(n) do nn
-        Array(interior(c_santee_data[nn], :, j_ymin, :))
+        mask_absent_tracer(interior(c_santee_data[nn], :, j_ymin, :))
     end
 
     c_winyah_xz_ymin = lift(n) do nn
-        Array(interior(c_winyah_data[nn], :, j_ymin, :))
+        mask_absent_tracer(interior(c_winyah_data[nn], :, j_ymin, :))
     end
 
     c_santee_yz_left = lift(n) do nn
-        Array(interior(c_santee_data[nn], i_left_channel, :, :))
+        mask_absent_tracer(interior(c_santee_data[nn], i_left_channel, :, :))
     end
 
     c_winyah_yz_left = lift(n) do nn
-        Array(interior(c_winyah_data[nn], i_left_channel, :, :))
+        mask_absent_tracer(interior(c_winyah_data[nn], i_left_channel, :, :))
     end
 
     c_santee_yz_right = lift(n) do nn
-        Array(interior(c_santee_data[nn], i_right_channel, :, :))
+        mask_absent_tracer(interior(c_santee_data[nn], i_right_channel, :, :))
     end
 
     c_winyah_yz_right = lift(n) do nn
-        Array(interior(c_winyah_data[nn], i_right_channel, :, :))
+        mask_absent_tracer(interior(c_winyah_data[nn], i_right_channel, :, :))
     end
 
-    hm_santee = heatmap!(ax_xy, xC, yC, c_santee_surface; colormap = :viridis, colorrange, alpha = 0.72)
-    hm_winyah = heatmap!(ax_xy, xC, yC, c_winyah_surface; colormap = :magma, colorrange, alpha = 0.62)
+    hm_santee = heatmap!(ax_xy, xC, yC, c_santee_surface; colormap = :viridis, colorrange, nan_color = :transparent, alpha = 0.72)
+    hm_winyah = heatmap!(ax_xy, xC, yC, c_winyah_surface; colormap = :magma, colorrange, nan_color = :transparent, alpha = 0.62)
 
-    heatmap!(ax_river, xC, zC, c_santee_xz_river; colormap = :viridis, colorrange, alpha = 0.72)
-    heatmap!(ax_river, xC, zC, c_winyah_xz_river; colormap = :magma, colorrange, alpha = 0.62)
-    heatmap!(ax_y5, xC, zC, c_santee_xz_y5; colormap = :viridis, colorrange, alpha = 0.72)
-    heatmap!(ax_y5, xC, zC, c_winyah_xz_y5; colormap = :magma, colorrange, alpha = 0.62)
-    heatmap!(ax_ymin, xC, zC, c_santee_xz_ymin; colormap = :viridis, colorrange, alpha = 0.72)
-    heatmap!(ax_ymin, xC, zC, c_winyah_xz_ymin; colormap = :magma, colorrange, alpha = 0.62)
-    heatmap!(ax_yz_left, yC, zC, c_santee_yz_left; colormap = :viridis, colorrange, alpha = 0.72)
-    heatmap!(ax_yz_left, yC, zC, c_winyah_yz_left; colormap = :magma, colorrange, alpha = 0.62)
-    heatmap!(ax_yz_right, yC, zC, c_santee_yz_right; colormap = :viridis, colorrange, alpha = 0.72)
-    heatmap!(ax_yz_right, yC, zC, c_winyah_yz_right; colormap = :magma, colorrange, alpha = 0.62)
+    heatmap!(ax_river, xC, zC, c_santee_xz_river; colormap = :viridis, colorrange, nan_color = :transparent, alpha = 0.72)
+    heatmap!(ax_river, xC, zC, c_winyah_xz_river; colormap = :magma, colorrange, nan_color = :transparent, alpha = 0.62)
+    heatmap!(ax_y5, xC, zC, c_santee_xz_y5; colormap = :viridis, colorrange, nan_color = :transparent, alpha = 0.72)
+    heatmap!(ax_y5, xC, zC, c_winyah_xz_y5; colormap = :magma, colorrange, nan_color = :transparent, alpha = 0.62)
+    heatmap!(ax_ymin, xC, zC, c_santee_xz_ymin; colormap = :viridis, colorrange, nan_color = :transparent, alpha = 0.72)
+    heatmap!(ax_ymin, xC, zC, c_winyah_xz_ymin; colormap = :magma, colorrange, nan_color = :transparent, alpha = 0.62)
+    heatmap!(ax_yz_left, yC, zC, c_santee_yz_left; colormap = :viridis, colorrange, nan_color = :transparent, alpha = 0.72)
+    heatmap!(ax_yz_left, yC, zC, c_winyah_yz_left; colormap = :magma, colorrange, nan_color = :transparent, alpha = 0.62)
+    heatmap!(ax_yz_right, yC, zC, c_santee_yz_right; colormap = :viridis, colorrange, nan_color = :transparent, alpha = 0.72)
+    heatmap!(ax_yz_right, yC, zC, c_winyah_yz_right; colormap = :magma, colorrange, nan_color = :transparent, alpha = 0.62)
 
     lines!(ax_yz_left, yC, [bathymetry(x_m[i_left_channel], y) for y in y_m]; color = :black, linewidth = 3)
     lines!(ax_yz_right, yC, [bathymetry(x_m[i_right_channel], y) for y in y_m]; color = :black, linewidth = 3)
@@ -984,6 +1134,76 @@ function save_3d_tracer_animation()
         time_label[] = string("t = ", round(times[nn] / 3600; digits = 1), " hour")
     end
 
+    return nothing
+end
+
+function save_3d_santee_tracer_animation()
+    filepath = joinpath(FILE_DIR, "instantaneous_fields.jld2")
+    c_santee_data = FieldTimeSeries(filepath, "c_santee")
+    Nt = length(c_santee_data.times)
+
+    Nt == 0 && return nothing
+
+    x_m = collect(xnodes(c_santee_data.grid, Center()))
+    y_m = collect(ynodes(c_santee_data.grid, Center()))
+    z_m = collect(znodes(c_santee_data.grid, Center()))
+
+    xC = x_m ./ 1e3
+    yC = y_m ./ 1e3
+    zC = z_m
+    times = c_santee_data.times
+    bottom = [bathymetry(x, y) for x in x_m, y in y_m]
+
+    fig = Figure(size = (1200, 900), fontsize = 18, backgroundcolor = :white)
+    ax = Axis3(fig[1, 1],
+               title = "3D Santee tracer plume",
+               xlabel = "x (km)",
+               ylabel = "y (km)",
+               zlabel = "z (m)",
+               azimuth = 0.7pi,
+               elevation = 0.18pi,
+               aspect = (1, 1, 0.45))
+
+    surface!(ax, xC, yC, bottom;
+             colormap = :deep,
+             colorrange = (-slope_depth, 0),
+             alpha = 0.55,
+             transparency = true)
+
+    xs0, ys0, zs0, cs0 = tracer_points(c_santee_data[1], xC, yC, zC)
+    xs = Observable(xs0)
+    ys = Observable(ys0)
+    zs = Observable(zs0)
+    cs = Observable(cs0)
+
+    santee_plume = scatter!(ax, xs, ys, zs;
+                            color = cs,
+                            colormap = :viridis,
+                            colorrange = (0.0, 1.0),
+                            markersize = 9,
+                            alpha = 0.75,
+                            transparency = true)
+
+    Colorbar(fig[1, 2], santee_plume; label = "Santee tracer")
+
+    time_label = Observable(string("t = ", round(times[1] / 3600; digits = 1), " hour"))
+    Label(fig[0, :], time_label, fontsize = 22)
+
+    xlims!(ax, extrema(xC)...)
+    ylims!(ax, extrema(yC)...)
+    zlims!(ax, -slope_depth, 5)
+
+    output_file = joinpath(FILE_DIR, "santee_tracer_3d.mp4")
+    CairoMakie.record(fig, output_file, 1:Nt; framerate = 6) do nn
+        new_xs, new_ys, new_zs, new_cs = tracer_points(c_santee_data[nn], xC, yC, zC)
+        xs[] = new_xs
+        ys[] = new_ys
+        zs[] = new_zs
+        cs[] = new_cs
+        time_label[] = string("t = ", round(times[nn] / 3600; digits = 1), " hour")
+    end
+
+    @info "Saved Santee-only 3D tracer animation" output_file
     return nothing
 end
 
@@ -1328,10 +1548,15 @@ if args["contours-only"]
     save_3d_tracer_contour_animation()
 elseif args["buoyancy-3d-only"]
     save_3d_buoyancy_animation()
+elseif args["surface-tracers-only"]
+    save_surface_tracer_animation()
+elseif args["santee-3d-only"]
+    save_3d_santee_tracer_animation()
 else
     save_surface_buoyancy_animation()
     save_surface_tracer_animation()
     save_3d_tracer_animation()
+    save_3d_santee_tracer_animation()
     save_3d_density_animation()
     save_3d_buoyancy_animation()
     save_3d_tracer_contour_animation()
