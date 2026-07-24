@@ -27,9 +27,40 @@ function parse_commandline()
             help = "Simulation stop time in seconds"
             arg_type = Float64
             default = 86400.0
+        "--pickup"
+            help = "Checkpoint restart mode: false, true/latest/recent/highest, iteration number, or checkpoint filepath"
+            arg_type = String
+            default = "false"
+        "--checkpoint-interval"
+            help = "Checkpoint interval in seconds"
+            arg_type = Float64
+            default = 3600.0
+        "--wind-speed"
+            help = "Wind speed in m/s. Positive is +x, upwelling-favorable in this setup"
+            arg_type = Float64
+            default = 0.0
+        "--wind-ramp-time"
+            help = "Wind ramp-up time in seconds"
+            arg_type = Float64
+            default = 21600.0
     end
 
     return parse_args(s)
+end
+
+function parse_pickup_argument(pickup)
+    pickup = strip(pickup)
+    pickup_lower = lowercase(pickup)
+
+    pickup_lower in ("false", "none", "no", "0") && return false
+    pickup_lower in ("true", "latest") && return :latest
+    pickup_lower in ("recent", "recent_time_stamp") && return :recent_time_stamp
+    pickup_lower in ("highest", "highest_iteration") && return :highest_iteration
+
+    iteration = tryparse(Int, pickup)
+    isnothing(iteration) || return iteration
+
+    return pickup
 end
 
 args = parse_commandline()
@@ -37,6 +68,8 @@ const ARCH = uppercase(args["arch"])
 ARCH in ("GPU", "CPU") || error("Invalid --arch $(ARCH); must be GPU or CPU")
 
 arch = ARCH == "GPU" ? GPU() : CPU()
+
+const PICKUP = parse_pickup_argument(args["pickup"])
 
 #####
 ##### Domain and buoyant inflow parameters
@@ -46,9 +79,9 @@ const Lx = 25e3
 const Ly = 15e3
 const Lz = 20.0
 
-const Δx = 20.0
-const Δy = 20.0
-const Nz = 200
+const Δx = 100.0
+const Δy = 100.0
+const Nz = 20
 const Δz = Lz / Nz
 
 const Nx = Int(Lx / Δx)
@@ -76,6 +109,13 @@ const N² = shelf_N²
 const plume_surface_buoyancy = max(santee_N², winyah_N²) * inlet_depth
 const f₀ = 1e-4
 const Cd = 2e-3
+const ρ₀ = 1025.0
+const ρ_air = 1.225
+const Cᴰ_air = 1.3e-3
+const WIND_SPEED = args["wind-speed"]
+const WIND_RAMP_TIME = args["wind-ramp-time"]
+const τx_wind = ρ_air * Cᴰ_air * WIND_SPEED * abs(WIND_SPEED)
+const τy_wind = 0.0
 const embayment_length_y = 200.0
 const river_mouth_y = y₁ - embayment_length_y
 const slope_depth = 15.0
@@ -94,7 +134,14 @@ const κ₄h = 1e5
 const ν₄z = 1e-3
 const κ₄z = 1e-3
 
-filename = string("MAMD_WB700_Santee10_Nx_", Nx, "_Ny_", Ny, "_Nz_", Nz, "_spacing_", Int(inlet_center_spacing), "m_30min")
+function wind_speed_suffix(speed)
+    speed == 0 && return ""
+    direction = speed > 0 ? "upwelling" : "downwelling"
+    speed_label = replace(string(round(abs(speed); digits = 1)), "." => "p")
+    return string("_", direction, speed_label, "ms")
+end
+
+filename = string("MAMD_WB400_Santee10_Nx_", Nx, "_Ny_", Ny, "_Nz_", Nz, "_spacing_", Int(inlet_center_spacing), "m_30min", wind_speed_suffix(WIND_SPEED))
 FILE_DIR = joinpath("Data", filename)
 mkpath(FILE_DIR)
 
@@ -140,6 +187,15 @@ end
 @inline function v_inflow_profile(x, z, t)
     return -inlet_speed_profile(x, z)
 end
+
+@inline function wind_ramp(t)
+    WIND_RAMP_TIME <= 0 && return 1.0
+    η = clamp(t / WIND_RAMP_TIME, 0.0, 1.0)
+    return η^2 * (3 - 2η)
+end
+
+@inline u_wind_stress(x, y, t) = wind_ramp(t) * τx_wind / ρ₀
+@inline v_wind_stress(x, y, t) = wind_ramp(t) * τy_wind / ρ₀
 
 @inline function inlet_buoyancy_profile(x, z)
     z >= -inlet_depth || return shelf_N² * z
@@ -206,13 +262,17 @@ c_winyah_north_bc = ValueBoundaryCondition(c_winyah_inflow_profile)
 
 quadratic_drag = BulkDrag(coefficient = Cd)
 no_slip_bc = ValueBoundaryCondition(0)
+u_wind_bc = FluxBoundaryCondition(u_wind_stress)
+v_wind_bc = FluxBoundaryCondition(v_wind_stress)
 
 u_bcs = FieldBoundaryConditions(immersed = quadratic_drag,
                                 bottom = quadratic_drag,
+                                top = u_wind_bc,
                                 north = no_slip_bc,
                                 west = u_west_bc)
 v_bcs = FieldBoundaryConditions(immersed = quadratic_drag,
                                 bottom = quadratic_drag,
+                                top = v_wind_bc,
                                 north = v_north_bc)
 w_bcs = FieldBoundaryConditions(north = no_slip_bc)
 b_bcs = FieldBoundaryConditions(north = b_north_bc)
@@ -478,7 +538,13 @@ simulation.output_writers[:jld2] = JLD2Writer(model, (; b, c_santee, c_winyah);
                                               filename = joinpath(FILE_DIR, "instantaneous_fields.jld2"),
                                               schedule = TimeInterval(1hour),
                                               with_halos = true,
-                                              overwrite_existing = true)
+                                              overwrite_existing = PICKUP === false)
+
+simulation.output_writers[:checkpointer] = Checkpointer(model;
+                                                        dir = FILE_DIR,
+                                                        prefix = "checkpoint",
+                                                        schedule = TimeInterval(args["checkpoint-interval"]),
+                                                        overwrite_existing = true)
 
 function nearest_index(nodes, value)
     return argmin(abs.(nodes .- value))
@@ -892,7 +958,7 @@ function save_3d_tracer_contour_animation()
     return nothing
 end
 
-run!(simulation)
+run!(simulation; pickup = PICKUP, checkpoint_at_end = true)
 save_surface_buoyancy_animation()
 save_surface_tracer_animation()
 save_3d_tracer_animation()
