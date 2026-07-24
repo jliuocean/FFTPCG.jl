@@ -98,3 +98,11 @@ statprof
 
 # Keep media
 !media/*
+
+# Local experiment backups and logs
+experiments/*.orig
+experiments/*.log
+jobs/logs/
+
+# Keep reproducible job scripts
+!jobs/*.sh
