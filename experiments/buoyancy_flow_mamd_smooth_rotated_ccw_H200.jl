@@ -72,7 +72,15 @@ function parse_commandline()
         "--checkpoint-interval"
             help = "Checkpoint interval in seconds"
             arg_type = Float64
-            default = 3600.0
+            default = 43200.0
+        "--progress-interval"
+            help = "Number of model iterations between progress diagnostics before wind starts"
+            arg_type = Int
+            default = 100
+        "--wind-progress-interval"
+            help = "Number of model iterations between progress diagnostics after wind ramp begins"
+            arg_type = Int
+            default = 50
         "--horizontal-resolution"
             help = "Uniform horizontal grid spacing in meters"
             arg_type = Float64
@@ -159,6 +167,10 @@ args = parse_commandline()
 args["setup-only"] && args["plot-only"] && error("--setup-only and --plot-only cannot be combined")
 args["simulation-only"] && args["plot-only"] && error("--simulation-only and --plot-only cannot be combined")
 args["simulation-only"] && args["setup-only"] && error("--simulation-only and --setup-only cannot be combined")
+args["checkpoint-interval"] > 0 || error("--checkpoint-interval must be positive")
+args["progress-interval"] > 0 || error("--progress-interval must be positive")
+args["wind-progress-interval"] > 0 || error("--wind-progress-interval must be positive")
+args["output-interval"] > 0 || error("--output-interval must be positive")
 plot_targets = (args["surface-buoyancy-only"], args["surface-tracers-only"],
                 args["surface-tracer-panels-only"],
                 args["surface-density-anomaly-only"],
@@ -719,6 +731,11 @@ end
 
 wall_clock = Ref(time_ns())
 function progress(sim)
+    progress_interval = sim.model.clock.time < WIND_START_TIME ?
+                        args["progress-interval"] :
+                        args["wind-progress-interval"]
+    iteration(sim) % progress_interval == 0 || return nothing
+
     now = time_ns()
     elapsed = 1e-9 * (now - wall_clock[])
     compute_divergence!(divergence, sim.model)
@@ -734,7 +751,10 @@ function progress(sim)
     wall_clock[] = now
     return nothing
 end
-simulation.callbacks[:progress] = Callback(progress, IterationInterval(5))
+progress_callback_interval = gcd(args["progress-interval"],
+                                 args["wind-progress-interval"])
+simulation.callbacks[:progress] =
+    Callback(progress, IterationInterval(progress_callback_interval))
 
 if !args["plot-only"]
     simulation.output_writers[:jld2] = JLD2Writer(model, (; b, c_santee, c_winyah);
@@ -1299,4 +1319,3 @@ else
     save_3d_winyah_tracer_animation()
     save_3d_santee_tracer_animation()
 end
-
